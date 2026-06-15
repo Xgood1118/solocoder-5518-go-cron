@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync"
 	"time"
@@ -18,13 +19,13 @@ import (
 )
 
 type Scheduler struct {
-	store       *storage.Store
-	cfg         config.SchedulerConfig
-	schedulerID string
-	cron        *cron.Cron
-	jobEntries  map[string]cron.EntryID
-	mu          sync.Mutex
-	pendingTasks chan string
+	store        *storage.Store
+	cfg          config.SchedulerConfig
+	schedulerID  string
+	cron         *cron.Cron
+	jobEntries   map[string]cron.EntryID
+	mu           sync.Mutex
+	_            chan string
 }
 
 func New(store *storage.Store, cfg config.SchedulerConfig) *Scheduler {
@@ -34,7 +35,6 @@ func New(store *storage.Store, cfg config.SchedulerConfig) *Scheduler {
 		schedulerID: uuid.NewString(),
 		cron:        cron.New(cron.WithSeconds()),
 		jobEntries:  make(map[string]cron.EntryID),
-		pendingTasks: make(chan string, 1000),
 	}
 }
 
@@ -48,6 +48,7 @@ func (s *Scheduler) Start(ctx context.Context) error {
 	go s.workerReaperLoop(ctx)
 	go s.deadLetterCleanerLoop(ctx)
 	go s.refreshMetricsLoop(ctx)
+	go s.taskAssignerLoop(ctx)
 
 	log.Info().Str("scheduler_id", s.schedulerID).Msg("scheduler started")
 	<-ctx.Done()
@@ -103,6 +104,10 @@ func (s *Scheduler) ReloadJob(jobID string) error {
 	return s.registerJob(job)
 }
 
+func genIdempotencyKey(jobID string, triggerType string) string {
+	return jobID + ":" + triggerType + ":" + time.Now().Format("20060102150405.000000000") + ":" + uuid.NewString()[:8]
+}
+
 func (s *Scheduler) dispatchJob(jobID, triggerType, idempotencyKey string) {
 	job, err := s.store.GetJob(jobID)
 	if err != nil {
@@ -115,6 +120,8 @@ func (s *Scheduler) dispatchJob(jobID, triggerType, idempotencyKey string) {
 			log.Info().Str("idempotency_key", idempotencyKey).Msg("task already exists, skipping")
 			return
 		}
+	} else {
+		idempotencyKey = genIdempotencyKey(jobID, triggerType)
 	}
 
 	ok, err := s.checkDependencies(job)
@@ -137,9 +144,6 @@ func (s *Scheduler) dispatchJob(jobID, triggerType, idempotencyKey string) {
 		IdempotencyKey: idempotencyKey,
 		CreatedAt:      now,
 		UpdatedAt:      now,
-	}
-	if idempotencyKey == "" {
-		task.IdempotencyKey = job.ID + ":" + now.Format("20060102150405")
 	}
 
 	if err := s.store.CreateTask(task); err != nil {
@@ -213,8 +217,24 @@ func (s *Scheduler) workerReaperLoop(ctx context.Context) {
 				log.Error().Err(err).Msg("worker reaper failed")
 				continue
 			}
+			if len(dead) == 0 {
+				continue
+			}
+			deadIDs := make([]string, 0, len(dead))
 			for _, w := range dead {
-				log.Warn().Str("worker_id", w.ID).Msg("worker timed out, reclaiming its tasks")
+				deadIDs = append(deadIDs, w.ID)
+				log.Warn().Str("worker_id", w.ID).Msg("worker timed out, will reassign its tasks")
+			}
+			aliveW, err := s.store.PickMostIdleWorker(s.cfg.HeartbeatTimeoutSec)
+			if err != nil {
+				log.Error().Err(err).Msg("cannot reassign dead worker tasks: no alive worker")
+				continue
+			}
+			n, err := s.store.ReassignDeadWorkerTasks(deadIDs, aliveW.ID)
+			if err != nil {
+				log.Error().Err(err).Msg("reassign dead worker tasks failed")
+			} else if n > 0 {
+				log.Info().Int64("reassigned", n).Str("to_worker", aliveW.ID).Msg("dead worker tasks reassigned")
 			}
 		}
 	}
@@ -248,6 +268,45 @@ func (s *Scheduler) refreshMetricsLoop(ctx context.Context) {
 		case <-ticker.C:
 			s.refreshMetrics()
 		}
+	}
+}
+
+func (s *Scheduler) taskAssignerLoop(ctx context.Context) {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.assignPendingTasks()
+		}
+	}
+}
+
+func (s *Scheduler) assignPendingTasks() {
+	for i := 0; i < 100; i++ {
+		task, err := s.store.FindUnassignedPendingTask()
+		if err != nil {
+			if !strings.Contains(err.Error(), "record not found") {
+				log.Error().Err(err).Msg("find unassigned task failed")
+			}
+			return
+		}
+		worker, err := s.store.PickMostIdleWorker(s.cfg.HeartbeatTimeoutSec)
+		if err != nil {
+			if !errors.Is(err, errors.New("no alive workers")) {
+				log.Error().Err(err).Msg("pick idle worker failed")
+			}
+			return
+		}
+		if err := s.store.AssignTaskToWorker(task.ID, worker.ID); err != nil {
+			log.Error().Err(err).Str("task_id", task.ID).Str("worker_id", worker.ID).Msg("assign task failed")
+			return
+		}
+		log.Debug().Str("task_id", task.ID).Str("worker_id", worker.ID).
+			Int("worker_running", worker.RunningTask).Int("worker_concurrency", worker.Concurrency).
+			Msg("task assigned to worker")
 	}
 }
 

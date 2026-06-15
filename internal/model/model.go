@@ -54,23 +54,24 @@ type Job struct {
 func (Job) TableName() string { return "jobs" }
 
 type Task struct {
-	ID            string     `gorm:"primaryKey;type:text" json:"id"`
-	JobID         string     `gorm:"not null;index;column:job_id" json:"job_id"`
-	Status        TaskStatus `gorm:"not null;index;type:text" json:"status"`
-	WorkerID      string     `gorm:"index;column:worker_id" json:"worker_id,omitempty"`
-	Stdout        string     `gorm:"type:text" json:"stdout,omitempty"`
-	Stderr        string     `gorm:"type:text" json:"stderr,omitempty"`
-	ExitCode      *int       `gorm:"column:exit_code" json:"exit_code,omitempty"`
-	RetryCount    int        `gorm:"not null;default:0;column:retry_count" json:"retry_count"`
-	NextRunAt     *time.Time `gorm:"index;column:next_run_at" json:"next_run_at,omitempty"`
-	StartedAt     *time.Time `gorm:"index;column:started_at" json:"started_at,omitempty"`
-	FinishedAt    *time.Time `gorm:"column:finished_at" json:"finished_at,omitempty"`
-	LeaseHolder   string     `gorm:"index;column:lease_holder" json:"lease_holder,omitempty"`
-	LeaseExpireAt *time.Time `gorm:"index;column:lease_expire_at" json:"lease_expire_at,omitempty"`
-	IdempotencyKey string    `gorm:"uniqueIndex;column:idempotency_key" json:"idempotency_key,omitempty"`
-	TriggerType   string     `gorm:"type:text;default:'cron';column:trigger_type" json:"trigger_type"`
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
+	ID             string     `gorm:"primaryKey;type:text" json:"id"`
+	JobID          string     `gorm:"not null;index;column:job_id" json:"job_id"`
+	Status         TaskStatus `gorm:"not null;index;type:text" json:"status"`
+	AssignedWorker string     `gorm:"index;column:assigned_worker" json:"assigned_worker,omitempty"`
+	WorkerID       string     `gorm:"index;column:worker_id" json:"worker_id,omitempty"`
+	Stdout         string     `gorm:"type:text" json:"stdout,omitempty"`
+	Stderr         string     `gorm:"type:text" json:"stderr,omitempty"`
+	ExitCode       *int       `gorm:"column:exit_code" json:"exit_code,omitempty"`
+	RetryCount     int        `gorm:"not null;default:0;column:retry_count" json:"retry_count"`
+	NextRunAt      *time.Time `gorm:"index;column:next_run_at" json:"next_run_at,omitempty"`
+	StartedAt      *time.Time `gorm:"index;column:started_at" json:"started_at,omitempty"`
+	FinishedAt     *time.Time `gorm:"column:finished_at" json:"finished_at,omitempty"`
+	LeaseHolder    string     `gorm:"index;column:lease_holder" json:"lease_holder,omitempty"`
+	LeaseExpireAt  *time.Time `gorm:"index;column:lease_expire_at" json:"lease_expire_at,omitempty"`
+	IdempotencyKey string     `gorm:"uniqueIndex;column:idempotency_key" json:"idempotency_key,omitempty"`
+	TriggerType    string     `gorm:"type:text;default:'cron';column:trigger_type" json:"trigger_type"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
 }
 
 func (Task) TableName() string { return "tasks" }

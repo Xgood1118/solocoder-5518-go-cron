@@ -23,11 +23,14 @@ import (
 )
 
 type Worker struct {
-	cfg         config.WorkerConfig
+	cfg          config.WorkerConfig
 	schedulerURL string
-	client      *http.Client
-	running     atomic.Int32
-	sem         chan struct{}
+	client       *http.Client
+	running      atomic.Int32
+	sem          chan struct{}
+
+	runningTasksMu sync.Mutex
+	runningTasks   map[string]struct{}
 }
 
 type pollResponse struct {
@@ -42,7 +45,8 @@ func New(cfg config.WorkerConfig) *Worker {
 		client: &http.Client{
 			Timeout: time.Duration(cfg.PollTimeoutSec+5) * time.Second,
 		},
-		sem: make(chan struct{}, cfg.Concurrency),
+		sem:          make(chan struct{}, cfg.Concurrency),
+		runningTasks: make(map[string]struct{}),
 	}
 }
 
@@ -88,14 +92,38 @@ func (w *Worker) Start(ctx context.Context) error {
 			continue
 		}
 		w.running.Add(1)
+		w.registerRunningTask(resp.Task.ID)
 		go func(task *model.Task, job *model.Job) {
 			defer func() {
+				w.unregisterRunningTask(task.ID)
 				w.running.Add(-1)
 				<-w.sem
 			}()
 			w.executeTask(ctx, task, job)
 		}(resp.Task, resp.Job)
 	}
+}
+
+func (w *Worker) registerRunningTask(taskID string) {
+	w.runningTasksMu.Lock()
+	defer w.runningTasksMu.Unlock()
+	w.runningTasks[taskID] = struct{}{}
+}
+
+func (w *Worker) unregisterRunningTask(taskID string) {
+	w.runningTasksMu.Lock()
+	defer w.runningTasksMu.Unlock()
+	delete(w.runningTasks, taskID)
+}
+
+func (w *Worker) snapshotRunningTasks() []string {
+	w.runningTasksMu.Lock()
+	defer w.runningTasksMu.Unlock()
+	ids := make([]string, 0, len(w.runningTasks))
+	for id := range w.runningTasks {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 func (w *Worker) heartbeatLoop(ctx context.Context) {
@@ -121,6 +149,15 @@ func (w *Worker) leaseRenewLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			ids := w.snapshotRunningTasks()
+			if len(ids) == 0 {
+				continue
+			}
+			for _, id := range ids {
+				if err := w.renewLease(id); err != nil {
+					log.Error().Err(err).Str("task_id", id).Msg("renew lease failed")
+				}
+			}
 		}
 	}
 }
@@ -148,6 +185,29 @@ func (w *Worker) sendHeartbeat() error {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("heartbeat returned status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func (w *Worker) renewLease(taskID string) error {
+	payload := map[string]string{
+		"task_id":   taskID,
+		"worker_id": w.cfg.WorkerID,
+	}
+	body, _ := json.Marshal(payload)
+	req, err := http.NewRequest("POST", w.schedulerURL+"/worker/tasks/"+taskID+"/renew", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("renew lease returned status %d: %s", resp.StatusCode, string(b))
 	}
 	return nil
 }

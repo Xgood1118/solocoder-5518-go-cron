@@ -31,6 +31,8 @@ func (m *Manager) Rerun(taskID string) error {
 	task.FinishedAt = nil
 	task.LeaseHolder = ""
 	task.LeaseExpireAt = nil
+	task.AssignedWorker = ""
+	task.WorkerID = ""
 	task.Stdout = ""
 	task.Stderr = ""
 	task.ExitCode = nil

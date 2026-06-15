@@ -477,6 +477,7 @@ func (s *Server) handleTaskReport(c *gin.Context) {
 		task.FinishedAt = &now
 		task.LeaseHolder = ""
 		task.LeaseExpireAt = nil
+		task.AssignedWorker = ""
 		log.Info().Str("task_id", task.ID).Str("job_id", task.JobID).Msg("task succeeded")
 	} else if status == model.TaskStatusFailed {
 		task.Stdout = req.Stdout
@@ -487,6 +488,7 @@ func (s *Server) handleTaskReport(c *gin.Context) {
 			task.FinishedAt = &now
 			task.LeaseHolder = ""
 			task.LeaseExpireAt = nil
+			task.AssignedWorker = ""
 			log.Warn().Str("task_id", task.ID).Str("job_id", task.JobID).Msg("task moved to dead letter")
 		} else {
 			task.RetryCount++
@@ -499,6 +501,7 @@ func (s *Server) handleTaskReport(c *gin.Context) {
 			task.NextRunAt = &nextRun
 			task.LeaseHolder = ""
 			task.LeaseExpireAt = nil
+			task.AssignedWorker = ""
 			log.Info().Str("task_id", task.ID).Str("job_id", task.JobID).
 				Int("retry_count", task.RetryCount).Time("next_run_at", nextRun).Msg("task scheduled for retry")
 		}

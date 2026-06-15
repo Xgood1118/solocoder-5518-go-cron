@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"database/sql"
 	"errors"
 	"time"
 
@@ -9,6 +10,8 @@ import (
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
+
+	_ "modernc.org/sqlite"
 
 	"github.com/solo-coder/go-cron/internal/model"
 )
@@ -20,7 +23,11 @@ type Store struct {
 }
 
 func NewStore(dbPath string) (*Store, error) {
-	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{
+	db, err := gorm.Open(sqlite.Dialector{
+		DriverName: "sqlite",
+		DSN:        dbPath,
+		Conn:        mustOpenDB(dbPath),
+	}, &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Warn),
 	})
 	if err != nil {
@@ -42,6 +49,15 @@ func NewStore(dbPath string) (*Store, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+func mustOpenDB(dsn string) *sql.DB {
+	sqldb, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		panic(err)
+	}
+	sqldb.SetMaxOpenConns(1)
+	return sqldb
 }
 
 func (s *Store) DB() *gorm.DB { return s.db }
@@ -149,6 +165,12 @@ func (s *Store) ListJobs(limit, offset int) ([]model.Job, int64, error) {
 	return jobs, total, nil
 }
 
+func (s *Store) ListAllJobs() ([]*model.Job, error) {
+	var jobs []*model.Job
+	err := s.db.Find(&jobs).Error
+	return jobs, err
+}
+
 func (s *Store) ListEnabledJobs() ([]model.Job, error) {
 	var jobs []model.Job
 	err := s.db.Where("enabled = ?", true).Find(&jobs).Error
@@ -246,6 +268,22 @@ func (s *Store) ListAliveWorkers(timeoutSec int) ([]model.Worker, error) {
 	return workers, err
 }
 
+func (s *Store) PickMostIdleWorker(timeoutSec int) (*model.Worker, error) {
+	cutoff := time.Now().Add(-time.Duration(timeoutSec) * time.Second)
+	var workers []model.Worker
+	err := s.db.Where("last_heartbeat > ?", cutoff).
+		Order("running_task asc").
+		Order("last_heartbeat desc").
+		Find(&workers).Error
+	if err != nil {
+		return nil, err
+	}
+	if len(workers) == 0 {
+		return nil, errors.New("no alive workers")
+	}
+	return &workers[0], nil
+}
+
 func (s *Store) ListDeadWorkers(timeoutSec int) ([]model.Worker, error) {
 	cutoff := time.Now().Add(-time.Duration(timeoutSec) * time.Second)
 	var workers []model.Worker
@@ -253,12 +291,21 @@ func (s *Store) ListDeadWorkers(timeoutSec int) ([]model.Worker, error) {
 	return workers, err
 }
 
+func (s *Store) AssignTaskToWorker(taskID, workerID string) error {
+	return s.db.Model(&model.Task{}).
+		Where("id = ?", taskID).
+		Updates(map[string]interface{}{
+			"assigned_worker": workerID,
+			"updated_at":        time.Now(),
+		}).Error
+}
+
 func (s *Store) LeaseTask(taskID, workerID string, ttlSec int) (bool, error) {
 	now := time.Now()
 	expireAt := now.Add(time.Duration(ttlSec) * time.Second)
 	result := s.db.Model(&model.Task{}).
-		Where("id = ? AND (lease_expire_at IS NULL OR lease_expire_at < ?) AND status IN ?",
-			taskID, now, []model.TaskStatus{model.TaskStatusPending, model.TaskStatusRetrying}).
+		Where("id = ? AND assigned_worker = ? AND (lease_expire_at IS NULL OR lease_expire_at < ?) AND status IN ?",
+			taskID, workerID, now, []model.TaskStatus{model.TaskStatusPending, model.TaskStatusRetrying}).
 		Updates(map[string]interface{}{
 			"status":          model.TaskStatusRunning,
 			"worker_id":       workerID,
@@ -286,7 +333,21 @@ func (s *Store) RenewLease(taskID, workerID string, ttlSec int) error {
 func (s *Store) FindNextTaskForWorker(workerID string) (*model.Task, error) {
 	var task model.Task
 	now := time.Now()
-	err := s.db.Where("(status = ? OR (status = ? AND next_run_at <= ?)) AND (lease_expire_at IS NULL OR lease_expire_at < ?)",
+	err := s.db.Where("assigned_worker = ? AND (status = ? OR (status = ? AND next_run_at <= ?)) AND (lease_expire_at IS NULL OR lease_expire_at < ?)",
+		workerID, model.TaskStatusPending, model.TaskStatusRetrying, now, now).
+		Order("created_at asc").
+		Limit(1).
+		First(&task).Error
+	if err != nil {
+		return nil, err
+	}
+	return &task, nil
+}
+
+func (s *Store) FindUnassignedPendingTask() (*model.Task, error) {
+	var task model.Task
+	now := time.Now()
+	err := s.db.Where("(assigned_worker IS NULL OR assigned_worker = '') AND (status = ? OR (status = ? AND next_run_at <= ?)) AND (lease_expire_at IS NULL OR lease_expire_at < ?)",
 		model.TaskStatusPending, model.TaskStatusRetrying, now, now).
 		Order("created_at asc").
 		Limit(1).
@@ -307,7 +368,28 @@ func (s *Store) ReclaimExpiredLeases(schedulerID string, ttlSec int) (int64, err
 			"started_at":      nil,
 			"lease_holder":    "",
 			"lease_expire_at": nil,
+			"assigned_worker": "",
 			"updated_at":      time.Now(),
+		})
+	return result.RowsAffected, result.Error
+}
+
+func (s *Store) ReassignDeadWorkerTasks(deadWorkerIDs []string, newWorkerID string) (int64, error) {
+	if len(deadWorkerIDs) == 0 {
+		return 0, nil
+	}
+	cutoff := time.Now()
+	result := s.db.Model(&model.Task{}).
+		Where("assigned_worker IN ? AND status IN ?",
+			deadWorkerIDs, []model.TaskStatus{model.TaskStatusPending, model.TaskStatusRetrying, model.TaskStatusRunning}).
+		Updates(map[string]interface{}{
+			"status":          model.TaskStatusPending,
+			"worker_id":       "",
+			"started_at":      nil,
+			"lease_holder":    "",
+			"lease_expire_at": nil,
+			"assigned_worker": newWorkerID,
+			"updated_at":      cutoff,
 		})
 	return result.RowsAffected, result.Error
 }
